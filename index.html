@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>竞价井字棋</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <h1>竞价井字棋 - 在线对战</h1>
+        
+        <!-- 昵称设置 -->
+        <div class="nickname-setup" v-if="!hasNickname">
+            <h2>欢迎来到竞价井字棋!</h2>
+            <p>首次登录需要设置您的游戏昵称</p>
+            <div class="nickname-input">
+                <input type="text" v-model="nicknameInput" placeholder="输入您的昵称" maxlength="10">
+                <button @click="setNickname">确认</button>
+            </div>
+        </div>
+        
+        <!-- 用户信息 -->
+        <div class="user-info" v-if="hasNickname">
+            <p>{{ nickname }} | 积分: {{ userPoints }}</p>
+        </div>
+        
+        <!-- 游戏大厅 -->
+        <div class="lobby" v-if="hasNickname && !inRoom">
+            <h2>游戏大厅</h2>
+            
+            <!-- 创建/加入房间 -->
+            <div class="room-actions">
+                <div class="create-room-container">
+                    <h3>创建房间</h3>
+                    <div class="base-bid-selection">
+                        <p>选择底分:</p>
+                        <div class="bid-options">
+                            <button
+                                v-for="bid in baseBidOptions"
+                                :key="bid"
+                                @click="selectBaseBid(bid)"
+                                :class="{ 'selected': selectedBaseBid === bid, 'disabled': userPoints < bid }"
+                                :disabled="userPoints < bid"
+                            >
+                                {{ bid }}
+                            </button>
+                        </div>
+                    </div>
+                    <button @click="createRoom" class="create-btn" :disabled="!selectedBaseBid">创建房间</button>
+                </div>
+                <div class="join-room">
+                    <input type="text" v-model="roomCodeInput" placeholder="输入房间代码" maxlength="6">
+                    <button @click="joinRoom">加入房间</button>
+                </div>
+            </div>
+            
+            <!-- 房间列表 -->
+            <div class="room-list-container">
+                <h3>当前活跃房间 <button @click="refreshRoomList" class="refresh-btn">刷新</button></h3>
+                <div v-if="roomList.length === 0" class="no-rooms">
+                    暂无活跃房间，请创建一个新房间！
+                </div>
+                <div v-else class="room-list">
+                    <div v-for="room in roomList" :key="room.roomCode" class="room-item">
+                        <div class="room-info">
+                            <span class="room-name">{{ room.roomName || '未命名房间' }}</span>
+                            <span class="room-status" :class="{ 'in-game': room.gameInProgress }">
+                                {{ room.gameInProgress ? '游戏中' : '等待中' }}
+                            </span>
+                        </div>
+                        <div class="room-details">
+                            <span>房间号: {{ room.roomCode }}</span>
+                            <span>玩家: {{ room.playerCount }}/2</span>
+                            <span>观众: {{ room.spectatorCount }}</span>
+                        </div>
+                        <div class="room-actions">
+                            <button @click="joinRoom(room.roomCode)"
+                                    :disabled="room.playerCount >= 2"
+                                    class="join-btn">
+                                {{ room.playerCount >= 2 ? '已满' : '加入游戏' }}
+                            </button>
+                            <button @click="spectateRoom(room.roomCode)" class="spectate-btn">
+                                观战
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- 等待对手 -->
+        <div class="waiting-room" v-if="inRoom && !opponentJoined && !isSpectator">
+            <h2>等待对手加入...</h2>
+            <div class="room-settings">
+                <div class="room-name-setting">
+                    <label>房间名称:</label>
+                    <input type="text" v-model="roomNameInput" placeholder="输入房间名称">
+                    <button @click="setRoomName">设置</button>
+                </div>
+            </div>
+            <p>房间代码: <span class="room-code">{{ roomCode }}</span></p>
+            <p>将此代码分享给你的对手以加入游戏</p>
+            <div class="spectator-info" v-if="spectatorCount > 0">
+                <p>当前有 {{ spectatorCount }} 名观众正在观战</p>
+            </div>
+            <button @click="leaveRoom" class="leave-btn">返回大厅</button>
+        </div>
+        
+        <!-- 游戏界面 -->
+        <div class="game-container" v-if="inRoom && (opponentJoined || isSpectator) && !gameOver">
+            <div class="room-header">
+                <h2>{{ roomName || '游戏房间' }}</h2>
+                <div class="room-info">
+                    <span>房间号: {{ roomCode }}</span>
+                    <span>底分: {{ currentBaseBid }}</span>
+                    <span v-if="spectatorCount > 0">观众: {{ spectatorCount }}</span>
+                    <span v-if="isSpectator" class="spectator-badge">观战模式</span>
+                </div>
+                <div class="room-actions">
+                    <button v-if="!isSpectator && !gameOver" @click="surrender" class="surrender-btn">认输</button>
+                    <button @click="leaveRoom" class="leave-btn">返回大厅</button>
+                </div>
+            </div>
+            <div class="player-info">
+                <div class="player" :class="{active: currentPlayer === 'X', 'current-player': playerType === 'X', 'spectating': isSpectator}">
+                    <h2>玩家 X {{ playerType === 'X' ? '(你)' : '' }}</h2>
+                    <p class="player-name">{{ playerXName || '等待玩家' }}</p>
+                    <p>积分: {{ playerXPoints }}</p>
+                    <p v-if="currentBaseBid === 10 && (playerType === 'X' || !biddingPhase)">当局剩余可出: {{ remainingBidsX }}</p>
+                    <div v-if="biddingPhase && playerType === 'X'">
+                        <input type="number" v-model.number="playerXBid" min="1" :max="Math.min(playerXPoints, currentBaseBid, remainingBidsX)">
+                        <button @click="submitBid('X')">提交出价</button>
+                    </div>
+                    <p v-if="!biddingPhase && lastBids.X !== null">本轮出价: {{ lastBids.X }}</p>
+                    <p v-else-if="playerType === 'X' && lastBidSubmitted">等待对手出价...</p>
+                </div>
+                
+                <div class="player" :class="{active: currentPlayer === 'O', 'current-player': playerType === 'O', 'spectating': isSpectator}">
+                    <h2>玩家 O {{ playerType === 'O' ? '(你)' : '' }}</h2>
+                    <p class="player-name">{{ playerOName || '等待玩家' }}</p>
+                    <p>积分: {{ playerOPoints }}</p>
+                    <p v-if="currentBaseBid === 10 && (playerType === 'O' || !biddingPhase)">当局剩余可出: {{ remainingBidsO }}</p>
+                    <div v-if="biddingPhase && playerType === 'O'">
+                        <input type="number" v-model.number="playerOBid" min="1" :max="Math.min(playerOPoints, currentBaseBid, remainingBidsO)">
+                        <button @click="submitBid('O')">提交出价</button>
+                    </div>
+                    <p v-if="!biddingPhase && lastBids.O !== null">本轮出价: {{ lastBids.O }}</p>
+                    <p v-else-if="playerType === 'O' && lastBidSubmitted">等待对手出价...</p>
+                </div>
+            </div>
+            
+            <div class="game-status">
+                <p v-if="biddingPhase && !lastBidSubmitted && tieCount > 0" class="tie-warning">
+                    双方出价相同，请重新出价！当前平局次数: {{ tieCount }}/3
+                </p>
+                <p v-else-if="biddingPhase && !lastBidSubmitted">竞价阶段: 请出价</p>
+                <p v-else-if="biddingPhase && lastBidSubmitted">等待对手出价...</p>
+                <p v-else>下棋阶段: 玩家{{ currentPlayer }}{{ playerType === currentPlayer ? '(你)' : '' }}获得落子权</p>
+                <p v-if="bidWinner && !biddingPhase">本轮获胜者: 玩家{{ bidWinner }}{{ playerType === bidWinner ? '(你)' : '' }}</p>
+            </div>
+            
+            <div class="board">
+                <div 
+                    v-for="(cell, index) in board" 
+                    :key="index" 
+                    class="cell"
+                    :class="{ 'X': cell === 'X', 'O': cell === 'O' }"
+                    @click="placeMark(index)"
+                >
+                    {{ cell }}
+                </div>
+            </div>
+        </div>
+        
+        <!-- 游戏结束 -->
+        <div class="game-over" v-if="inRoom && gameOver">
+            <h2>游戏结束!</h2>
+            <p v-if="winner">玩家 {{ winner }} {{ winner === playerType ? '(你)' : '' }} 获胜!</p>
+            <p v-else>平局!</p>
+            <button @click="resetGame" v-if="!isSpectator && !opponentLeft && !hostLeft">再来一局</button>
+            <button @click="leaveRoom">返回大厅</button>
+        </div>
+        
+        <!-- 对手离开 -->
+        <div class="opponent-left" v-if="opponentLeft && !isSpectator">
+            <h2>对手已离开游戏</h2>
+            <div class="spectator-info" v-if="spectatorCount > 0">
+                <p>当前有 {{ spectatorCount }} 名观众正在观战</p>
+            </div>
+            <button @click="leaveRoom">返回大厅</button>
+        </div>
+        
+        <!-- 房主离开 -->
+        <div class="host-left" v-if="hostLeft">
+            <h2>房主已关闭房间</h2>
+            <button @click="leaveRoom">返回大厅</button>
+        </div>
+        
+        <div class="rules">
+            <h3>游戏规则:</h3>
+            <ul>
+                <li>每位玩家初始有100积分</li>
+                <li>房间可设置不同底分：10、100、1000、10000</li>
+                <li>每轮玩家出价不能超过房间底分</li>
+                <li>底分10的局中，每位玩家整局所出积分不能超过10</li>
+                <li>出价高的玩家获得落子权，双方都扣除相应出价</li>
+                <li>获胜者拿回自己本局总出价，并获得对方本局总出价</li>
+                <li>玩家可以选择认输，对方将获得胜利和双方本局出价的积分</li>
+                <li>游戏开始后退出房间视为认输，对方获胜并获得所有出价积分</li>
+                <li>率先连成一条线的玩家获胜</li>
+                <li>出价至少为1积分，如果一方积分用完，则直接判定对方获胜</li>
+                <li>双方出价一致时重新比价，连续3次则和局，双方损失出价的积分</li>
+            </ul>
+        </div>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>
